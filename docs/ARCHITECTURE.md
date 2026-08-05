@@ -6,9 +6,10 @@
 >
 > - Want to get started → [playbook.md](playbook.md), [User-guide.md](User-guide.md)
 > - Want the protocol spec → [2026-05-06-telos-protocol.md](2026-05-06-telos-protocol.md)
+> - Want the local KV control-plane proposal → [telos-sglang-hicache-lmcache-design.md](telos-sglang-hicache-lmcache-design.md)
 > - Want the change history → [../CHANGELOG.md](../CHANGELOG.md)
 >
-> Last updated: 2026-05-18
+> Last updated: 2026-08-05
 
 ---
 
@@ -99,7 +100,8 @@ telos-sdk/                         (Python package name = telos; pyproject maps 
 │   ├── openai.py          OpenAIAdapter (layout + routing key)
 │   ├── deepseek.py        DeepSeekAdapter (zero control plane)
 │   ├── vllm.py            VLLMAdapter (bidirectional)
-│   └── sglang.py          SGLangAdapter (bidirectional, superset of vLLM)
+│   ├── openai_chat.py     Shared stock Chat Completions renderer
+│   └── sglang.py          SGLangAdapter (stock RadixAttention/HiCache-safe)
 │
 ├── output_filter/         RTK-style tool result filtering layer (orthogonal to TELOS)
 │   ├── mode.py            TelosMode four-state switch
@@ -111,6 +113,9 @@ telos-sdk/                         (Python package name = telos; pyproject maps 
 │   ├── pipeline.py        process_anthropic_request: parse→bridge→emit pure function
 │   ├── inspector.py       SessionInspector: in-memory diagnostic snapshot store
 │   └── __main__.py        `python -m telos.proxy` entry point
+│
+├── deploy/sglang/         Stock SGLang + HiCache launch/config templates
+├── scripts/               Live SGLang A/B and HiCache restore contract runners
 │
 ├── replay/                Recording → replay comparison engine
 │   ├── __init__.py        replay_session engine
@@ -323,18 +328,18 @@ each round. If not passed, the Bridge news up its own one, degrading to "indepen
 real requests within the renewal window is below the threshold, refresh is skipped, letting the cache expire naturally and avoiding a renewal
 cost > benefit for low-activity sessions.
 
-### 5.5 Bidirectional Operations (vLLM / SGLang only)
+### 5.5 Bidirectional Operations (extension adapters only)
 
 `is_bidirectional` = `isinstance(engine, BidirectionalEngineAdapter)`.
 
-| Bridge Method | Closed-source API | vLLM / SGLang |
+| Bridge Method | Stock/closed adapter | Capability-verified extension adapter |
 |---|---|---|
-| `probe_cache()` | Returns `ProbeResult(hit=False)` | Actually sends a lookup, asking "is the prefix still in cache" |
-| `cooperative_fold(...)` | Equivalent to `fold()` + returns `{}` | Client-side fold + returns the server's `evict_span` / `fork_and_replace` fragments |
+| `probe_cache()` | Returns `ProbeResult(hit=False)` | May issue a verified lookup asking "is the prefix still in cache" |
+| `cooperative_fold(...)` | Equivalent to `fold()` + returns `{}` | Client-side fold + returns a negotiated `evict_span` / `fork_and_replace` fragment |
 | `emit_with_extras(extras)` | Merges the fragments into `plan.extras` then emits | Same as left |
 
-`cooperative_fold` is "zero-recompute Fold": with a closed-source API, every fold requires the server to
-re-prefill the entire segment; vLLM/SGLang let the server keep the prefix KV untouched and only recompute the summary tail.
+Stock SGLang does not implement this interface. Its Fold path changes the suffix and lets RadixAttention
+naturally reuse only the token-identical prefix before the branch; the compacted suffix still requires Prefill.
 
 ---
 
@@ -442,18 +447,27 @@ relies on `isinstance` to guarantee it never calls them by mistake.
 
 ### 7.2 Capability Matrix
 
+> The SGLang column is the stock-safe default. vLLM remains a prototype private-extension adapter;
+> its private `cache_policy` contract must not be used against an unpatched stock runtime. The
+> [local KV control-plane design](telos-sglang-hicache-lmcache-design.md) defines
+> `native` / `config_only` / `extension` / `unsupported` levels.
+
 | Field | Anthropic | OpenAI | DeepSeek | vLLM | SGLang |
 |---|:---:|:---:|:---:|:---:|:---:|
-| `explicit_breakpoints` | ✓ | ✗ | ✗ | ✓ | ✓ |
-| `max_breakpoints` | **4** | 0 | 0 | 2 | 2 |
+| `explicit_breakpoints` | ✓ | ✗ | ✗ | ✓ | ✗ |
+| `max_breakpoints` | **4** | 0 | 0 | 2 | 0 |
 | `ttl_control` | presets(5m/1h) | presets(in-memory/24h) | none | none | none |
-| `prewarmable` | ✓(`max_tokens:0`) | ✗ | ✗ | ✓(`max_tokens:1`) | ✓(`prewarm_only`) |
-| `routing_key` | ✗ | ✓(`prompt_cache_key`) | ✗ | ✓(`cache_salt`) | ✓(`affinity_key`) |
-| `cache_probe` | ✗ | ✗ | ✗ | ✓ | ✓ |
-| `span_eviction` | ✗ | ✗ | ✗ | ✓ | ✓ |
-| `fork_and_replace` | ✗ | ✗ | ✗ | ✗ | ✓ |
-| `tier_hint` | ✗ | ✗ | ✗ | ✗ | ✓ |
-| Bidirectional class | No | No | No | Yes | Yes |
+| `prewarmable` | ✓(`max_tokens:0`) | ✗ | ✗ | ✓(`max_tokens:1`) | ✗ |
+| `routing_key` | ✗ | ✓(`prompt_cache_key`) | ✗ | ✓(`cache_salt`) | ✗ |
+| `cache_probe` | ✗ | ✗ | ✗ | ✓ | ✗ |
+| `span_eviction` | ✗ | ✗ | ✗ | ✓ | ✗ |
+| `fork_and_replace` | ✗ | ✗ | ✗ | ✗ | ✗ |
+| `tier_hint` | ✗ | ✗ | ✗ | ✗ | ✗ |
+| Bidirectional class | No | No | No | Yes (prototype) | No |
+| `cache.prefix_reuse` | — | — | — | — | native |
+| `cache.cache_report` | — | — | — | — | config_only |
+| `cache.tier_report` | — | — | — | — | native |
+| `cache.hierarchical_storage` | — | — | — | — | config_only |
 
 ### 7.3 Each Engine's emit Strategy
 
@@ -474,12 +488,15 @@ relies on `isinstance` to guarantee it never calls them by mistake.
 - **DeepSeek** ([deepseek.py](../engine/deepseek.py)) — zero control plane. The disk
   context cache is always on. `plan_marks` returns an empty `EmitPlan()`. emit relies only on arranging
   blocks as non-DROP→DROP so the exact-match prefix hits.
-- **vLLM** ([vllm.py](../engine/vllm.py)) — bidirectional. emit writes the private extension field
-  `cache_policy` (`pin_prefix_until_block` / `evict_span`) + `cache_salt`.
-- **SGLang** ([sglang.py](../engine/sglang.py)) — a strict superset of vLLM. emit writes
-  the private `cache_control` (`lock_radix_path` / `path_hash` / `prefer_tier`
-  / `affinity_key` / `fork_from_path` / `replace_suffix`). Adds `fork_and_replace`
-  and `tier_hint` (HiCache GPU/CPU/disk).
+- **vLLM** ([vllm.py](../engine/vllm.py)) — prototype bidirectional adapter. emit writes
+  `cache_salt` plus the private-extension field `cache_policy`
+  (`pin_prefix_until_block` / `evict_span`); stock deployments must not receive the private field.
+- **SGLang** ([sglang.py](../engine/sglang.py)) — stock OpenAI Chat Completions adapter.
+  It emits no private cache fields. RadixAttention provides automatic prefix reuse;
+  `--enable-cache-report` and HiCache/LMCache are server-startup configuration. When an
+  upstream explicitly enables `tier_telemetry`, the adapter adds SGLang's public
+  `return_cached_tokens_details` request field and normalizes response tiers
+  `device/host/storage` to `gpu/cpu/l3`; missing fields remain unknown.
 
 ### 7.4 usage Parsing
 
@@ -488,7 +505,13 @@ relies on `isinstance` to guarantee it never calls them by mistake.
 | Anthropic | `cache_read_input_tokens` | `cache_creation_input_tokens` |
 | OpenAI | `prompt_tokens_details.cached_tokens` | always 0 |
 | DeepSeek | `prompt_cache_hit_tokens` | always 0 (write cost folded into the miss price) |
-| vLLM / SGLang | `cached_tokens` | always 0 |
+| vLLM | `cached_tokens` (version-dependent) | always 0 |
+| SGLang | `prompt_tokens_details.cached_tokens` with `--enable-cache-report`; legacy fallback may read `cached_tokens` | always 0 |
+
+For SGLang HiCache, `cache_runtime.backend` records the configured deployment label and
+optional `cache_runtime.hit_tier_tokens`, `restored_tokens`, and `storage_backend` come
+only from `sglext.cached_tokens_details`. Telos does not infer a tier from aggregate
+`cached_tokens`.
 
 ---
 

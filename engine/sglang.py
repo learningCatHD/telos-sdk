@@ -1,21 +1,10 @@
-"""SGLang adapter (open-source inference engine, RadixAttention + HiCache).
+"""Stock-compatible SGLang adapter.
 
-Basis:
-- RadixAttention: a token-level radix-tree cache; the cache-aware scheduler
-  reorders requests by prefix affinity.
-- HiCache: a three-tier GPU/CPU/disk cache; a ``prefer_tier`` hint can be
-  given in the request.
-- usage fields ``prompt_tokens`` + ``cached_tokens``; HiCache additionally
-  returns ``cache_hierarchy_breakdown: {gpu, cpu, disk}``.
-
-A superset of vLLM:
-- ``fork_and_replace`` is truly usable → ``Fold`` achieves "zero recomputation"
-- ``affinity_key`` lets the CASS scheduler land same-prefix requests on the
-  same worker
-- ``tier_hint`` allows keeping PIN on the GPU and sinking FOLD to the CPU,
-  avoiding mutual contention
-
-Field names are centralized in the ``_SGLANG_EXT`` constant (to cope with O5 renames).
+SGLang's public OpenAI-compatible endpoint relies on automatic RadixAttention
+prefix matching. HiCache and LMCache are selected at server startup; they are
+not request-level ``cache_control`` fields. This adapter therefore emits only
+standard Chat Completions fields and declares active controls unsupported
+until a separate capability-negotiated extension is implemented.
 """
 
 from __future__ import annotations
@@ -25,182 +14,159 @@ import json
 from typing import Any, Mapping
 
 from telos.engine.base import (
-    BidirectionalEngineAdapter,
+    CacheCapabilities,
     EmitPlan,
+    EngineAdapter,
     EngineCapabilities,
-    MarkSlot,
-    ProbeResult,
+    UnsupportedWireProtocolError,
+    WireProtocol,
 )
+from telos.engine.openai_chat import render_chat_completions
 from telos.ir import Band, TelosIR, UsageReport
 
 
-_SGLANG_EXT = "cache_control"
+class SGLangAdapter(EngineAdapter):
+    """SGLang OpenAI-compatible adapter in safe stock mode."""
 
-
-class SGLangAdapter(BidirectionalEngineAdapter):
     @property
     def capabilities(self) -> EngineCapabilities:
         return EngineCapabilities(
-            explicit_breakpoints=True,
+            explicit_breakpoints=False,
             ttl_control="none",
-            prewarmable=True,
-            routing_key=True,                 # implemented by affinity_key
-            retention_policy="configurable",
-            max_breakpoints=2,
-            cache_probe=True,
-            span_eviction=True,
-            fork_and_replace=True,            # fully supported
-            tier_hint=True,                   # HiCache
-            pin_unpin=True,
+            prewarmable=False,
+            routing_key=False,
+            retention_policy="fixed",
+            max_breakpoints=0,
+            cache=CacheCapabilities(
+                prefix_reuse="native",
+                cache_report="config_only",
+                tier_report="native",
+                hierarchical_storage="config_only",
+                request_namespace="unsupported",
+                cache_manifest="unsupported",
+                boundary_resolution="unsupported",
+                retention_hint="unsupported",
+                prefetch_hint="unsupported",
+                explicit_evict="unsupported",
+            ),
         )
 
-    # ------------------------------------------------------------------
     def plan_marks(self, ir: TelosIR) -> EmitPlan:
-        slots: list[MarkSlot] = []
-        last_sys_pin = _last_index(ir.system, Band.PIN)
-        if last_sys_pin is not None:
-            slots.append(MarkSlot(
-                name="lock_radix", segment="system", index=last_sys_pin,
-                ttl_class="long",
-            ))
-        if ir.messages:
-            mi = len(ir.messages) - 1
-            blocks = ir.messages[mi].blocks
-            for j in range(len(blocks) - 1, -1, -1):
-                if blocks[j].band is not Band.DROP:
-                    slots.append(MarkSlot(
-                        name="rolling_tail", segment="message", index=j,
-                        message_index=mi, ttl_class="short",
-                    ))
-                    break
-        # affinity_key: hash the toolset + system PIN + ref-pool slug set into a single key
-        affinity = self._affinity_key(ir)
+        """Return diagnostics only; stock SGLang has no explicit mark slots."""
         return EmitPlan(
-            slots=tuple(slots),
-            routing_key=affinity,
-            extras={"path_hash": affinity},
+            extras={"prefix_digest": self._prefix_digest(ir)},
         )
 
-    # ------------------------------------------------------------------
     def emit(self, ir: TelosIR, plan: EmitPlan) -> Mapping[str, Any]:
-        wire_messages: list[dict[str, Any]] = []
-        sys_text = "\n\n".join(str(b.payload) for b in _band_sorted(ir.system))
-        if sys_text:
-            wire_messages.append({"role": "system", "content": sys_text})
-        for msg in ir.messages:
-            parts: list[str] = []
-            for blk in _band_sorted(msg.blocks):
-                if blk.kind == "tool_result":
-                    parts.append(str(blk.payload.get("content", "")))
-                else:
-                    parts.append(str(blk.payload) if not isinstance(blk.payload, dict)
-                                 else json.dumps(blk.payload, sort_keys=True))
-            wire_messages.append({"role": msg.role, "content": "\n".join(parts)})
+        """Emit a stock OpenAI Chat Completions body.
 
-        # cache_control: translate the plan into SGLang private fields
-        ctrl: dict[str, Any] = {}
-        for slot in plan.slots:
-            if slot.name == "lock_radix":
-                ctrl["lock_radix_path"] = True
-                ctrl["path_hash"] = plan.extras.get("path_hash")
-        # tier hint: give an overall preference based on the band distribution (conservative: default gpu)
-        ctrl["prefer_tier"] = "gpu"
-        if plan.routing_key:
-            ctrl["affinity_key"] = plan.routing_key
-        # allow the bridge to inject fork_from_path / replace_suffix / evict_span via extras
-        for k in ("fork_from_path", "replace_suffix", "evict_span"):
-            if k in plan.extras:
-                ctrl[k] = plan.extras[k]
+        ``plan`` remains useful for diagnostics, but none of its logical marks
+        are serialized because stock SGLang has no public per-span control
+        contract. RadixAttention finds the longest matching token prefix
+        automatically.
+        """
+        return render_chat_completions(
+            ir,
+            model=ir.hints.model or "sglang-served",
+        )
 
-        body: dict[str, Any] = {
-            "model": ir.hints.model or "sglang-served",
-            "messages": wire_messages,
-        }
-        if ir.tools:
-            body["tools"] = [b.payload for b in ir.tools]
-        if ctrl:
-            body[_SGLANG_EXT] = ctrl
-        return body
+    def emit_for_protocol(
+        self,
+        ir: TelosIR,
+        plan: EmitPlan,
+        *,
+        protocol: WireProtocol,
+    ) -> Mapping[str, Any]:
+        if protocol != "openai-chat":
+            raise UnsupportedWireProtocolError(
+                f"SGLangAdapter does not emit protocol {protocol!r}"
+            )
+        return self.emit(ir, plan)
 
     def parse_usage(self, response: Mapping[str, Any]) -> UsageReport:
-        usage = response.get("usage", {})
-        prompt = int(usage.get("prompt_tokens", 0))
-        cached = int(usage.get("cached_tokens", 0))
+        usage_obj = response.get("usage", {})
+        usage = usage_obj if isinstance(usage_obj, Mapping) else {}
+        details_obj = usage.get("prompt_tokens_details", {})
+        details = details_obj if isinstance(details_obj, Mapping) else {}
+        prompt = int(usage.get("prompt_tokens", 0) or 0)
+        # Official SGLang --enable-cache-report shape first; retain the legacy
+        # top-level form for old pinned images and existing telemetry fixtures.
+        cached = int(details.get("cached_tokens", usage.get("cached_tokens", 0)) or 0)
         return UsageReport(
             raw_input=max(0, prompt - cached),
             cache_read=cached,
             cache_write=0,
-            output=int(usage.get("completion_tokens", 0)),
-            raw=usage,                        # contains cache_hierarchy_breakdown
+            output=int(usage.get("completion_tokens", 0) or 0),
+            raw=usage,
         )
 
-    # ------------------------------------------------------------------
-    # Bidirectional operations
-    # ------------------------------------------------------------------
-    def probe(self, ir: TelosIR, plan: EmitPlan) -> ProbeResult:
-        """Construct a radix lookup request; the caller actually sends ``POST /v1/cache/lookup``."""
-        return ProbeResult(hit=False, cached_token_count=0, tier="none")
-
-    def evict_span(
-        self, ir: TelosIR, start_block: int, end_block: int,
-    ) -> Mapping[str, Any]:
-        return {"evict_span": [start_block, end_block]}
-
-    def fork_and_replace(
+    def cache_telemetry_request_fields(
         self,
-        ir: TelosIR,
-        path_hash: str,
-        replace_suffix: Mapping[str, Any],
+        *,
+        tier_details: bool = False,
     ) -> Mapping[str, Any]:
-        """``Fold``'s true zero-recomputation implementation.
+        """Opt in to SGLang's public per-tier cache telemetry extension."""
+        if not tier_details:
+            return {}
+        return {"return_cached_tokens_details": True}
 
-        When the bridge performs a fold, it merges this return value into the
-        plan.extras of the next emit:
+    def parse_cache_telemetry(
+        self,
+        response: Mapping[str, Any],
+    ) -> Mapping[str, Any]:
+        """Parse current SGLang ``sglext.cached_tokens_details`` safely.
 
-            extras["fork_from_path"] = path_hash
-            extras["replace_suffix"] = replace_suffix
-
-        On receiving it, SGLang forks a new branch from the radix node
-        ``path_hash`` and replaces the span after it directly with
-        ``replace_suffix`` — the prefix KV stays unchanged, only the much
-        shorter summary tail is recomputed.
+        SGLang reports device, host, and optional external-storage token
+        counts. The Telos schema names those physical tiers gpu/cpu/l3 while
+        retaining the reported storage backend. Older SGLang versions simply
+        produce no telemetry, which is represented as an empty mapping.
         """
+        extension = response.get("sglext")
+        if not isinstance(extension, Mapping):
+            return {}
+        details = extension.get("cached_tokens_details")
+        if not isinstance(details, Mapping):
+            return {}
+
+        def _token_count(name: str) -> int | None:
+            value = details.get(name)
+            if value is None:
+                return 0
+            if isinstance(value, bool):
+                return None
+            try:
+                parsed = int(value)
+            except (TypeError, ValueError):
+                return None
+            return parsed if parsed >= 0 else None
+
+        device = _token_count("device")
+        host = _token_count("host")
+        storage = _token_count("storage")
+        if device is None or host is None or storage is None:
+            return {}
+
+        backend = details.get("storage_backend")
+        if backend is not None and not isinstance(backend, str):
+            backend = str(backend)
         return {
-            "fork_from_path": path_hash,
-            "replace_suffix": dict(replace_suffix),
+            "source": "sglext.cached_tokens_details",
+            "hit_tier_tokens": {
+                "gpu": device,
+                "cpu": host,
+                "l3": storage,
+            },
+            "storage_backend": backend or None,
         }
 
-    def refresh(self, ir: TelosIR, plan: EmitPlan) -> Mapping[str, Any]:
-        """``prewarm_only`` mode: do not schedule generation, only fill the radix path."""
-        body = dict(self.emit(ir, plan))
-        ctrl = dict(body.get(_SGLANG_EXT, {}))
-        ctrl["prewarm_only"] = True
-        body[_SGLANG_EXT] = ctrl
-        body["max_tokens"] = 1
-        body["stream"] = False
-        return body
-
-    # ------------------------------------------------------------------
-    def _affinity_key(self, ir: TelosIR) -> str:
-        h = hashlib.sha256()
-        for b in ir.tools:
-            h.update(json.dumps(b.payload, sort_keys=True).encode())
-        for b in ir.system:
-            if b.band is Band.PIN:
-                h.update(str(b.payload).encode())
+    def _prefix_digest(self, ir: TelosIR) -> str:
+        """Diagnostic identity of the stable tool + system PIN prefix."""
+        digest = hashlib.sha256()
+        for block in ir.tools:
+            digest.update(json.dumps(block.payload, sort_keys=True).encode())
+        for block in ir.system:
+            if block.band is Band.PIN:
+                digest.update(str(block.payload).encode())
         for slug in sorted(ir.ref_pool):
-            h.update(slug.encode())
-        return f"telos-sgl-{h.hexdigest()[:16]}"
-
-
-# ---------------------------------------------------------------------------
-def _last_index(blocks, band) -> int | None:
-    for i in range(len(blocks) - 1, -1, -1):
-        if blocks[i].band is band:
-            return i
-    return None
-
-
-def _band_sorted(blocks):
-    rank = {Band.PIN: 0, Band.FOLD: 1, Band.DROP: 2}
-    return sorted(blocks, key=lambda b: rank[b.band])
+            digest.update(slug.encode())
+        return f"sha256:{digest.hexdigest()}"

@@ -491,8 +491,8 @@ class Bridge:
         return self._stats.cumulative_cache_creation
 
     # ------------------------------------------------------------------
-    # Bidirectional operations (only open-source inference implementations like
-    # vLLM / SGLang; all no-ops on closed-source APIs)
+    # Bidirectional operations (only capability-verified extension adapters;
+    # stock SGLang and closed APIs remain no-ops)
     # ------------------------------------------------------------------
 
     @property
@@ -502,7 +502,7 @@ class Bridge:
     def probe_cache(self) -> ProbeResult:
         """**Probe**: ask the server "is the prefix still in the cache?"
 
-        Closed-source APIs simply return ``hit=False``; vLLM / SGLang really issue a lookup.
+        Adapters without a verified lookup extension return ``hit=False``.
         The bridge uses this result to decide whether to skip an imminent ``refresh``,
         saving one RTT.
         """
@@ -522,9 +522,8 @@ class Bridge:
 
         Unlike a plain ``fold()``: this method not only modifies the IR but also returns a
         ``cache_control`` / ``cache_policy`` fragment for the caller to merge into the next
-        emit's plan extras. Once the server receives it, it really releases the old KV
-        blocks (vLLM) or forks the radix path (SGLang), achieving "zero-recompute Fold" --
-        something closed-source APIs simply cannot do.
+        emit's plan extras. Physical eviction/fork behavior is available only
+        when a concrete extension adapter declares and implements that contract.
 
         Calling this method on a closed-source API is equivalent to ``fold()`` + returning ``{}``.
         """
@@ -534,7 +533,7 @@ class Bridge:
             return {}
 
         caps = self._engine.capabilities
-        # Prefer fork_and_replace (fully supported by SGLang, partially by vLLM)
+        # Prefer fork_and_replace when the extension explicitly advertises it.
         if caps.fork_and_replace and message_range is not None:
             plan = self._engine.plan_marks(self._ir)
             path_hash = plan.extras.get("path_hash") or plan.routing_key or ""

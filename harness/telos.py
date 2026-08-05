@@ -244,7 +244,7 @@ class TelosPlugin(HarnessPlugin):
             messages=tuple(messages),
             ref_pool=ref_pool,
             hints=TelosHints(
-                engine=engine if engine in ("anthropic", "openai", "deepseek") else "openai",  # type: ignore[arg-type]
+                engine=engine,  # type: ignore[arg-type]
                 model=model or raw_request.get("model", ""),
                 expected_turns=expected_turns,
             ),

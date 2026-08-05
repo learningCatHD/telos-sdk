@@ -9,7 +9,8 @@ A lightweight JSON config file that records:
   default guess)
 - ``upstreams``            slug → {url, engine, path}; the gateway forwards
   ``/upstreams/<slug>/<...>`` requests to ``url``, using ``engine`` to drive the
-  TELOS pipeline. Defaults cover anthropic / openrouter / deepseek; user-added
+  TELOS pipeline. Defaults cover Anthropic, OpenRouter, DeepSeek, OpenAI, and a
+  stock-safe local SGLang target at ``http://127.0.0.1:30000``; user-added
   entries are preserved verbatim.
 
 Design principles:
@@ -63,6 +64,23 @@ class GatewayConfig:
 
 
 @dataclass(frozen=True)
+class UpstreamCacheConfig:
+    """Cache behavior for one upstream.
+
+    Phase 1 implements ``off`` and stock automatic prefix reuse. Active
+    capability negotiation remains a later extension, so unsupported mode
+    strings safely normalize to ``stock`` while loading older/future configs.
+    """
+
+    mode: str = "stock"  # "off" | "stock"
+    backend: str = "auto"  # "auto" | "radix" | "hicache" | "lmcache"
+    tier_telemetry: bool = False
+    security_namespace: str = ""
+    allow_cross_session: bool = False
+    capability_ttl_seconds: int = 60
+
+
+@dataclass(frozen=True)
 class UpstreamConfig:
     """One named forward target.
 
@@ -89,6 +107,7 @@ class UpstreamConfig:
     engine: str
     protocol: str  # "anthropic-messages" | "openai-chat"
     via: str = ""
+    cache: UpstreamCacheConfig = field(default_factory=UpstreamCacheConfig)
 
 
 _DEFAULT_UPSTREAMS: dict[str, UpstreamConfig] = {
@@ -118,6 +137,18 @@ _DEFAULT_UPSTREAMS: dict[str, UpstreamConfig] = {
         engine="openai",
         protocol="openai-chat",
     ),
+    "local-sglang": UpstreamConfig(
+        url="http://127.0.0.1:30000",
+        engine="sglang",
+        protocol="openai-chat",
+        cache=UpstreamCacheConfig(
+            mode="stock",
+            backend="radix",
+            tier_telemetry=False,
+            security_namespace="local-dev",
+            allow_cross_session=False,
+        ),
+    ),
 }
 
 
@@ -127,6 +158,33 @@ def default_upstreams() -> dict[str, UpstreamConfig]:
 
 
 _VALID_PROTOCOLS = ("anthropic-messages", "openai-chat")
+_VALID_CACHE_MODES = ("off", "stock")
+_VALID_CACHE_BACKENDS = ("auto", "radix", "hicache", "lmcache")
+
+
+def _parse_upstream_cache(raw: Any) -> UpstreamCacheConfig:
+    if not isinstance(raw, dict):
+        return UpstreamCacheConfig()
+    mode = raw.get("mode", "stock")
+    if mode not in _VALID_CACHE_MODES:
+        mode = "stock"
+    backend = raw.get("backend", "auto")
+    if backend not in _VALID_CACHE_BACKENDS:
+        backend = "auto"
+    namespace = raw.get("security_namespace", "")
+    ttl = raw.get("capability_ttl_seconds", 60)
+    try:
+        ttl_seconds = max(1, int(ttl))
+    except (TypeError, ValueError):
+        ttl_seconds = 60
+    return UpstreamCacheConfig(
+        mode=str(mode),
+        backend=str(backend),
+        tier_telemetry=raw.get("tier_telemetry") is True,
+        security_namespace=str(namespace or ""),
+        allow_cross_session=raw.get("allow_cross_session") is True,
+        capability_ttl_seconds=ttl_seconds,
+    )
 
 
 def _parse_upstreams(raw: Any) -> dict[str, UpstreamConfig]:
@@ -158,6 +216,7 @@ def _parse_upstreams(raw: Any) -> dict[str, UpstreamConfig]:
             engine=engine,
             protocol=protocol,
             via=str(via),
+            cache=_parse_upstream_cache(entry.get("cache")),
         )
     return out
 
@@ -174,6 +233,15 @@ def _serialize_upstreams(upstreams: dict[str, UpstreamConfig]) -> dict[str, Any]
         # tidy on round-trip.
         if u.via:
             entry["via"] = u.via
+        if u.cache != UpstreamCacheConfig():
+            entry["cache"] = {
+                "mode": u.cache.mode,
+                "backend": u.cache.backend,
+                "tier_telemetry": u.cache.tier_telemetry,
+                "security_namespace": u.cache.security_namespace,
+                "allow_cross_session": u.cache.allow_cross_session,
+                "capability_ttl_seconds": u.cache.capability_ttl_seconds,
+            }
         out[slug] = entry
     return out
 

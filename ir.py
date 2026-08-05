@@ -63,6 +63,48 @@ BlockKind = Literal[
     "thinking",
 ]
 
+EngineName = Literal["anthropic", "openai", "deepseek", "vllm", "sglang"]
+ReuseScope = Literal["request", "session", "project", "tenant"]
+RetentionClass = Literal["hot", "warm", "cold", "drop"]
+Sensitivity = Literal["private", "project", "tenant"]
+
+
+@dataclass(frozen=True)
+class LogicalPosition:
+    """Engine-neutral block position; token boundaries are resolved downstream."""
+
+    segment: Literal["tools", "system", "message"]
+    index: int
+    message_index: int | None = None
+
+
+@dataclass(frozen=True)
+class CacheBoundary:
+    """A logical cache boundary and its advisory retention class."""
+
+    name: str
+    end: LogicalPosition
+    band: Band
+    retention: RetentionClass
+    expected_reuses: int = 0
+
+
+@dataclass(frozen=True)
+class CacheIntent:
+    """Advisory cache policy for a capability-negotiated engine extension.
+
+    Stock adapters deliberately do not serialize this object. ``namespace``
+    must come from trusted gateway identity, never from user prompt text.
+    """
+
+    schema_version: int
+    namespace: str
+    reuse_scope: ReuseScope
+    sensitivity: Sensitivity
+    boundaries: tuple[CacheBoundary, ...]
+    next_use_distance: int | None = None
+    branch_parent: str | None = None
+
 
 @dataclass(frozen=True)
 class TelosBlock:
@@ -113,13 +155,14 @@ class TelosIR:
     messages: tuple[TelosMessage, ...]
     ref_pool: Mapping[str, TelosBlock]             #: slug → block
     hints: "TelosHints" = field(default_factory=lambda: TelosHints())
+    cache_intent: CacheIntent | None = None
 
 
 @dataclass(frozen=True)
 class TelosHints:
     """Non-binding metadata the engine adapter uses to make plan decisions."""
 
-    engine: Literal["anthropic", "openai", "deepseek"] = "anthropic"
+    engine: EngineName = "anthropic"
     model: str = ""
     expected_turns: int = 0       #: the harness's estimate of total turns; affects the mid-rolling anchor toggle
 
@@ -214,6 +257,73 @@ def assert_ir_invariants(ir: TelosIR) -> None:
     assert_band_order(ir.system, "system")
     for i, msg in enumerate(ir.messages):
         assert_band_order(msg.blocks, f"messages[{i}] (role={msg.role})")
+    if ir.cache_intent is not None:
+        _assert_cache_intent(ir, ir.cache_intent)
+
+
+def _assert_cache_intent(ir: TelosIR, intent: CacheIntent) -> None:
+    if intent.schema_version != 1:
+        raise TelosInvariantError(
+            f"Unsupported CacheIntent schema_version={intent.schema_version!r}"
+        )
+    namespace = intent.namespace
+    if (not namespace or len(namespace) > 256
+            or any(ord(ch) < 33 or ord(ch) == 127 for ch in namespace)):
+        raise TelosInvariantError(
+            "CacheIntent namespace must be a non-empty opaque token without whitespace/control characters"
+        )
+    if intent.reuse_scope not in {"request", "session", "project", "tenant"}:
+        raise TelosInvariantError(f"Invalid CacheIntent reuse_scope={intent.reuse_scope!r}")
+    if intent.sensitivity not in {"private", "project", "tenant"}:
+        raise TelosInvariantError(f"Invalid CacheIntent sensitivity={intent.sensitivity!r}")
+    if intent.next_use_distance is not None and intent.next_use_distance < 0:
+        raise TelosInvariantError("CacheIntent next_use_distance must be non-negative")
+
+    seen_names: set[str] = set()
+    for boundary in intent.boundaries:
+        if not boundary.name or boundary.name in seen_names:
+            raise TelosInvariantError(
+                f"CacheIntent boundary names must be non-empty and unique: {boundary.name!r}"
+            )
+        seen_names.add(boundary.name)
+        if boundary.expected_reuses < 0:
+            raise TelosInvariantError(
+                f"CacheIntent boundary {boundary.name!r} has negative expected_reuses"
+            )
+        target = _block_at_position(ir, boundary.end)
+        if target.band is not boundary.band:
+            raise TelosInvariantError(
+                f"CacheIntent boundary {boundary.name!r} declares band={boundary.band.value!r} "
+                f"but points to band={target.band.value!r}"
+            )
+
+
+def _block_at_position(ir: TelosIR, pos: LogicalPosition) -> TelosBlock:
+    if pos.index < 0:
+        raise TelosInvariantError("CacheIntent boundary index must be non-negative")
+    if pos.segment == "tools":
+        if pos.message_index is not None:
+            raise TelosInvariantError("tools boundary cannot have message_index")
+        blocks = ir.tools
+    elif pos.segment == "system":
+        if pos.message_index is not None:
+            raise TelosInvariantError("system boundary cannot have message_index")
+        blocks = ir.system
+    elif pos.segment == "message":
+        if pos.message_index is None:
+            raise TelosInvariantError("message boundary requires message_index")
+        if not 0 <= pos.message_index < len(ir.messages):
+            raise TelosInvariantError(
+                f"CacheIntent message_index {pos.message_index} is out of range"
+            )
+        blocks = ir.messages[pos.message_index].blocks
+    else:
+        raise TelosInvariantError(f"Invalid CacheIntent segment={pos.segment!r}")
+    if pos.index >= len(blocks):
+        raise TelosInvariantError(
+            f"CacheIntent {pos.segment} index {pos.index} is out of range"
+        )
+    return blocks[pos.index]
 
 
 # ---------------------------------------------------------------------------

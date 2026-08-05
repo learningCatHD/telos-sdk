@@ -1,0 +1,17 @@
+{
+  "upstreams": {
+    "local-sglang-hicache": {
+      "url": "http://127.0.0.1:30000",
+      "engine": "sglang",
+      "protocol": "openai-chat",
+      "cache": {
+        "mode": "stock",
+        "backend": "hicache",
+        "tier_telemetry": true,
+        "security_namespace": "single-tenant-local",
+        "allow_cross_session": false,
+        "capability_ttl_seconds": 60
+      }
+    }
+  }
+}

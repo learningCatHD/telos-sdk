@@ -17,6 +17,36 @@ from telos.ir import TelosIR, UsageReport
 # Capability matrix
 # ---------------------------------------------------------------------------
 
+FeatureSupport = Literal[
+    "unsupported", "native", "config_only", "extension", "emulated",
+]
+WireProtocol = Literal[
+    "anthropic-messages", "openai-chat", "openai-responses",
+]
+
+
+@dataclass(frozen=True)
+class CacheCapabilities:
+    """Feature-level support exposed by an engine's public cache contract.
+
+    ``config_only`` means the runtime provides the feature through server
+    configuration, not through a per-request field. ``extension`` is reserved
+    for a capability-negotiated Telos extension and must not be sent to a
+    stock server.
+    """
+
+    prefix_reuse: FeatureSupport = "unsupported"
+    cache_report: FeatureSupport = "unsupported"
+    tier_report: FeatureSupport = "unsupported"
+    hierarchical_storage: FeatureSupport = "unsupported"
+    request_namespace: FeatureSupport = "unsupported"
+    cache_manifest: FeatureSupport = "unsupported"
+    boundary_resolution: FeatureSupport = "unsupported"
+    retention_hint: FeatureSupport = "unsupported"
+    prefetch_hint: FeatureSupport = "unsupported"
+    explicit_evict: FeatureSupport = "unsupported"
+
+
 @dataclass(frozen=True)
 class EngineCapabilities:
     """Declares which cache control primitives an engine supports.
@@ -36,12 +66,16 @@ class EngineCapabilities:
     thinking_preserved_across_non_tool_result: bool = False
     """Fix R6: True only for Opus 4.5+/Sonnet 4.6+; False for all earlier models and Haiku."""
 
-    # —— Bidirectional capabilities (vLLM / SGLang only; all False for closed APIs) ——
+    # —— Deprecated active-control flags. Stock adapters keep these False; a
+    # verified patched-runtime adapter may opt in explicitly. ——
     cache_probe: bool = False        #: client can read server-side cache hit status
     span_eviction: bool = False      #: client can explicitly release a span of KV blocks
     fork_and_replace: bool = False   #: SGLang radix fork: replace the tail while keeping the prefix
     tier_hint: bool = False          #: HiCache three-tier (GPU/CPU/disk) explicit hint
     pin_unpin: bool = False          #: explicit pin / unpin to prevent LRU eviction
+    # Feature-level truth source. The booleans above remain for compatibility
+    # with existing adapters and are deprecated for new cache integrations.
+    cache: CacheCapabilities = field(default_factory=CacheCapabilities)
 
 
 # ---------------------------------------------------------------------------
@@ -99,14 +133,57 @@ class EngineAdapter(ABC):
     def parse_usage(self, response: Mapping[str, Any]) -> UsageReport:
         """Extract usage from the engine response, normalized into a ``UsageReport``."""
 
+    def cache_telemetry_request_fields(
+        self,
+        *,
+        tier_details: bool = False,
+    ) -> Mapping[str, Any]:
+        """Return adapter-owned opt-in fields for public cache telemetry.
+
+        The default is deliberately empty. A stock adapter may override this
+        only for a documented public request field; private cache controls
+        belong behind a separately negotiated extension.
+        """
+        return {}
+
+    def parse_cache_telemetry(
+        self,
+        response: Mapping[str, Any],
+    ) -> Mapping[str, Any]:
+        """Normalize engine-specific cache-tier telemetry.
+
+        Missing or malformed telemetry returns an empty mapping. Callers must
+        not infer a physical cache tier from the aggregate cached-token count.
+        """
+        return {}
+
+    def emit_for_protocol(
+        self,
+        ir: TelosIR,
+        plan: EmitPlan,
+        *,
+        protocol: WireProtocol,
+    ) -> Mapping[str, Any]:
+        """Emit for an explicitly selected transport protocol.
+
+        Adapters opt in protocol by protocol. This prevents an OpenAI
+        Responses body from accidentally being sent to Chat Completions.
+        """
+        raise UnsupportedWireProtocolError(
+            f"{type(self).__name__} does not emit protocol {protocol!r}"
+        )
+
     def refresh(self, ir: TelosIR, plan: EmitPlan) -> None:
         """Optional: issue a keep-alive request; no-op by default."""
         return None
 
 
+class UnsupportedWireProtocolError(ValueError):
+    """Raised when an adapter cannot render the requested wire protocol."""
+
+
 # ---------------------------------------------------------------------------
-# Bidirectional mixin —— implemented only by vLLM / SGLang; the bridge uses
-# isinstance to detect it
+# Bidirectional extension mixin; the bridge uses isinstance to detect it.
 # ---------------------------------------------------------------------------
 
 @dataclass(frozen=True)
@@ -119,7 +196,7 @@ class ProbeResult:
 
 
 class BidirectionalEngineAdapter(EngineAdapter):
-    """The "read + write" control plane unique to open-source inference engines.
+    """Optional active-control plane for a verified runtime extension.
 
     An adapter implementing this abstract class must set the corresponding
     capability bits to True in ``capabilities``; the bridge runs an
@@ -151,12 +228,11 @@ class BidirectionalEngineAdapter(EngineAdapter):
         path_hash: str,
         replace_suffix: Mapping[str, Any],
     ) -> Mapping[str, Any]:
-        """Radix fork + suffix replacement; SGLang-exclusive, only partially
-        supported by vLLM.
+        """Request a radix fork + suffix replacement from an extension.
 
         Effect: keep the prefix KV corresponding to ``path_hash`` unchanged,
         and replace the span after it with ``replace_suffix`` (typically a
-        short summary). This is ``Fold``'s true "zero recomputation"
-        implementation — closed APIs simply cannot do this.
+        short summary). A concrete adapter must document the exact server
+        contract and recomputation semantics before enabling the capability.
         """
         return {}

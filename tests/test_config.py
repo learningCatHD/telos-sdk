@@ -26,6 +26,10 @@ def test_load_missing_returns_defaults() -> None:
     assert c.favorite_harness is None
     assert c.upstreams["openai"].url == "https://api.openai.com"
     assert c.upstreams["openai"].engine == "openai"
+    assert c.upstreams["local-sglang"].url == "http://127.0.0.1:30000"
+    assert c.upstreams["local-sglang"].cache.mode == "stock"
+    assert c.upstreams["local-sglang"].cache.backend == "radix"
+    assert c.upstreams["local-sglang"].cache.tier_telemetry is False
     print("✓ test_load_missing_returns_defaults")
 
 
@@ -78,6 +82,68 @@ def test_bad_json_raises() -> None:
         print("✓ test_bad_json_raises")
         return
     raise AssertionError("expected RuntimeError")
+
+
+def test_upstream_cache_config_round_trip() -> None:
+    _with_home(_tmp_home())
+    c = cfgmod.load_config()
+    c.upstreams["sglang-hicache"] = cfgmod.UpstreamConfig(
+        url="http://127.0.0.1:31000",
+        engine="sglang",
+        protocol="openai-chat",
+        cache=cfgmod.UpstreamCacheConfig(
+            mode="stock",
+            backend="hicache",
+            tier_telemetry=True,
+            security_namespace="opaque:local-dev",
+            allow_cross_session=False,
+            capability_ttl_seconds=90,
+        ),
+    )
+    cfgmod.save_config(c)
+    loaded = cfgmod.load_config().upstreams["sglang-hicache"]
+    assert loaded.cache.security_namespace == "opaque:local-dev"
+    assert loaded.cache.backend == "hicache"
+    assert loaded.cache.tier_telemetry is True
+    assert loaded.cache.allow_cross_session is False
+    assert loaded.cache.capability_ttl_seconds == 90
+
+
+def test_unknown_cache_mode_fails_safe_to_stock() -> None:
+    home = _tmp_home()
+    _with_home(home)
+    (home / "config.json").write_text(json.dumps({
+        "upstreams": {
+            "future": {
+                "url": "http://127.0.0.1:32000",
+                "engine": "sglang",
+                "protocol": "openai-chat",
+                "cache": {"mode": "future-active-control"},
+            },
+        },
+    }))
+    assert cfgmod.load_config().upstreams["future"].cache.mode == "stock"
+
+
+def test_unknown_cache_backend_fails_safe_to_auto() -> None:
+    home = _tmp_home()
+    _with_home(home)
+    (home / "config.json").write_text(json.dumps({
+        "upstreams": {
+            "future": {
+                "url": "http://127.0.0.1:32000",
+                "engine": "sglang",
+                "protocol": "openai-chat",
+                "cache": {
+                    "backend": "unknown-private-plugin",
+                    "tier_telemetry": True,
+                },
+            },
+        },
+    }))
+    cache = cfgmod.load_config().upstreams["future"].cache
+    assert cache.backend == "auto"
+    assert cache.tier_telemetry is True
 
 
 def test_revert_upstreams_owned_by() -> None:
@@ -139,6 +205,9 @@ def main() -> None:
     test_update_config()
     test_unknown_keys_preserved()
     test_bad_json_raises()
+    test_upstream_cache_config_round_trip()
+    test_unknown_cache_mode_fails_safe_to_stock()
+    test_unknown_cache_backend_fails_safe_to_auto()
     test_revert_upstreams_owned_by()
     print("\nall config tests passed.")
 

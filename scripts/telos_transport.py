@@ -37,6 +37,8 @@ from typing import Any, Mapping
 
 from telos import Band, Bridge, load_engine, load_harness
 from telos.bridge import BridgeSessionState, _canonicalize_ir
+from telos.engine.base import UnsupportedWireProtocolError
+from telos.engine.openai_chat import render_chat_completions
 
 
 # ---------------------------------------------------------------------------
@@ -44,56 +46,8 @@ from telos.bridge import BridgeSessionState, _canonicalize_ir
 # ---------------------------------------------------------------------------
 
 def _ir_to_chat_completions(ir, *, model: str) -> dict[str, Any]:
-    # system: PIN first, DROP last
-    sys_blocks = sorted(ir.system, key=lambda b: 0 if b.band is not Band.DROP else 1)
-    sys_text = "\n\n".join(str(b.payload) for b in sys_blocks)
-
-    wire_messages: list[dict[str, Any]] = []
-    if sys_text.strip():
-        wire_messages.append({"role": "system", "content": sys_text})
-
-    for m in ir.messages:
-        ordered = sorted(m.blocks, key=lambda b: 0 if b.band is not Band.DROP else 1)
-
-        if m.role == "user":
-            # Pull tool_result out separately into role=tool; join the remaining text into one user message
-            tr = [b for b in ordered if b.kind == "tool_result"]
-            for trb in tr:
-                payload = trb.payload or {}
-                wire_messages.append({
-                    "role": "tool",
-                    "tool_call_id": payload.get("tool_use_id", ""),
-                    "content": str(payload.get("content", "")),
-                })
-            text_parts = [str(b.payload) for b in ordered if b.kind == "text"]
-            joined = "\n".join(p for p in text_parts if p)
-            if joined.strip():
-                wire_messages.append({"role": "user", "content": joined})
-
-        elif m.role == "assistant":
-            text_parts = [str(b.payload) for b in ordered if b.kind == "text"]
-            tool_calls = [b.payload for b in ordered if b.kind == "tool_use"]
-            reasoning_parts = [str(b.payload) for b in ordered if b.kind == "reasoning"]
-            entry: dict[str, Any] = {
-                "role": "assistant",
-                "content": "\n".join(text_parts) if text_parts else None,
-            }
-            if tool_calls:
-                entry["tool_calls"] = list(tool_calls)
-            if reasoning_parts:
-                # DeepSeek / OpenAI thinking-mode contract: the previous turn's
-                # ``reasoning_content`` must be echoed back verbatim on every
-                # subsequent request, otherwise the upstream rejects with HTTP
-                # 400 ("reasoning_content in the thinking mode must be passed
-                # back to the API"). Concatenation matches the harness's
-                # behavior for multi-text-block messages.
-                entry["reasoning_content"] = "\n".join(reasoning_parts)
-            wire_messages.append(entry)
-
-    wire: dict[str, Any] = {"model": model, "messages": wire_messages}
-    if ir.tools:
-        wire["tools"] = [b.payload for b in ir.tools]
-    return wire
+    """Backward-compatible import path for the shared renderer."""
+    return render_chat_completions(ir, model=model)
 
 
 # ---------------------------------------------------------------------------
@@ -282,6 +236,7 @@ class TelosOpenAITransport:
         )
         self._harness = load_harness(harness_name)
         self._engine = load_engine(engine_name)
+        self._engine_name = engine_name
         self._session_id = session_id
         self._usage_log = Path(usage_log) if usage_log else None
         self._trace_log = Path(prompt_trace_log) if prompt_trace_log else None
@@ -317,21 +272,21 @@ class TelosOpenAITransport:
         ir = self._harness.parse(
             kwargs,
             session_id=self._session_id,
-            engine="deepseek",
+            engine=self._engine_name,
             model=model,
         )
         ir_in_summary = _summarize_ir(ir)
 
         # 2. Bridge: pass session_state so the R8 counters / cache_creation accumulate across turns
         bridge = Bridge(ir, self._engine, session_state=self._session_state)
-        plan = bridge.mark()
-        plan_summary = _summarize_plan(plan)
 
         # 3. Canonicalize (tools ordering, payload key ordering) — cannot use the
         # ir snapshot directly; it must run through _canonicalize_ir to guarantee
         # the multi-round prefix bytes are stable. This is the key fix on the
         # OpenAI path: previously ir2 was fed straight to the wire builder, skipping this step.
         ir2 = _canonicalize_ir(bridge.snapshot_ir())
+        plan = self._engine.plan_marks(ir2)
+        plan_summary = _summarize_plan(plan)
         ir_out_summary = _summarize_ir(ir2)
         regions = _flatten_regions(ir_out_summary)
         # Growth process: char changes relative to the previous call (by segment & band)
@@ -352,7 +307,12 @@ class TelosOpenAITransport:
                 },
                 "total": regions["total"] - prev["total"],
             }
-        wire = _ir_to_chat_completions(ir2, model=model)
+        try:
+            wire = dict(self._engine.emit_for_protocol(
+                ir2, plan, protocol="openai-chat",
+            ))
+        except UnsupportedWireProtocolError:
+            wire = _ir_to_chat_completions(ir2, model=model)
         # 4. pass through some fields that telos does not care about
         for k in ("temperature", "top_p", "max_tokens", "stream",
                   "timeout", "tool_choice", "response_format"):
@@ -367,8 +327,8 @@ class TelosOpenAITransport:
             if self._prev_wire_text else 0
 
         # The real request is about to be sent — equivalent to the +1 at the end
-        # of bridge.emit_with_plan, since this OpenAI path uses the custom
-        # _ir_to_chat_completions rather than engine.emit.
+        # of bridge.emit_with_plan. This path renders explicitly for the
+        # Chat Completions protocol instead of calling Bridge.emit_with_plan.
         self._session_state.stats.real_requests_since_refresh += 1
 
         # 5. actually send the request

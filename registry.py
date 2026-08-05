@@ -69,7 +69,9 @@ def load_engine(name: str) -> "EngineAdapter":
 
     Supported:
     - Closed-source APIs: ``anthropic``, ``openai``, ``deepseek``
-    - Open-source inference (bidirectionally aware): ``vllm``, ``sglang``
+    - Open-source inference: ``vllm``, ``sglang``. Only adapters backed by a
+      verified control-plane extension implement bidirectional operations;
+      stock SGLang relies on automatic RadixAttention prefix reuse.
     """
     if name == "anthropic":
         from telos.engine.anthropic import AnthropicAdapter

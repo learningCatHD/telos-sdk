@@ -87,10 +87,10 @@ def test_emit_round_trip_three_engines() -> None:
     print("✓ test_emit_round_trip_three_engines")
 
 
-def test_bidirectional_only_on_open_engines() -> None:
-    """vLLM / SGLang are bidirectional; the three closed-source ones are not."""
+def test_bidirectional_only_on_verified_extensions() -> None:
+    """Stock SGLang must not claim an unimplemented active control plane."""
     harness = load_harness("openclaw")
-    bidi = {"vllm", "sglang"}
+    bidi = {"vllm"}
     for name in ("anthropic", "openai", "deepseek", "vllm", "sglang"):
         ir = harness.parse(RAW_REQUEST, session_id=f"b-{name}", engine=name)
         bridge = Bridge(ir, load_engine(name))
@@ -100,22 +100,32 @@ def test_bidirectional_only_on_open_engines() -> None:
         probe = bridge.probe_cache()
         if name not in bidi:
             assert probe.hit is False
-    print("✓ test_bidirectional_only_on_open_engines")
+    print("✓ test_bidirectional_only_on_verified_extensions")
 
 
-def test_cooperative_fold_emits_cache_control() -> None:
-    """SGLang's fork-and-replace must put the cache_control field into the next wire."""
+def test_sglang_stock_fold_emits_no_private_control() -> None:
+    """Stock SGLang folds client-side and relies on natural prefix reuse."""
     harness = load_harness("openclaw")
     ir = harness.parse(RAW_REQUEST, session_id="cf-sgl", engine="sglang",
                        model="deepseek-ai/DeepSeek-V3")
     bridge = Bridge(ir, load_engine("sglang"))
     ctrl = bridge.cooperative_fold(message_range=(1, 3), summary="<folded>")
-    assert "fork_from_path" in ctrl, f"expected fork_from_path in {ctrl}"
+    assert ctrl == {}
     wire = bridge.emit_with_extras(ctrl)
-    cc = wire.get("cache_control", {})
-    assert "fork_from_path" in cc and "replace_suffix" in cc, \
-        f"wire.cache_control missing fork fields: {cc}"
-    print("✓ test_cooperative_fold_emits_cache_control")
+    assert "cache_control" not in wire
+    assert "telos_cache" not in wire
+    print("✓ test_sglang_stock_fold_emits_no_private_control")
+
+
+def test_sglang_capabilities_are_truthful() -> None:
+    caps = load_engine("sglang").capabilities
+    assert caps.cache.prefix_reuse == "native"
+    assert caps.cache.cache_report == "config_only"
+    assert caps.cache.hierarchical_storage == "config_only"
+    assert caps.span_eviction is False
+    assert caps.fork_and_replace is False
+    assert caps.pin_unpin is False
+    print("✓ test_sglang_capabilities_are_truthful")
 
 
 def test_vllm_pin_cache_policy() -> None:
@@ -173,7 +183,8 @@ def test_usage_normalization() -> None:
         ("vllm",      {"usage": {"prompt_tokens": 1100, "cached_tokens": 1000,
                                   "completion_tokens": 10}},
          (100, 1000, 0)),
-        ("sglang",    {"usage": {"prompt_tokens": 1100, "cached_tokens": 1000,
+        ("sglang",    {"usage": {"prompt_tokens": 1100,
+                                  "prompt_tokens_details": {"cached_tokens": 1000},
                                   "completion_tokens": 10}},
          (100, 1000, 0)),
     ]
@@ -191,8 +202,9 @@ def main() -> None:
     test_refpool_lifts_large_doc()
     test_anthropic_mark_slots()
     test_emit_round_trip_three_engines()
-    test_bidirectional_only_on_open_engines()
-    test_cooperative_fold_emits_cache_control()
+    test_bidirectional_only_on_verified_extensions()
+    test_sglang_stock_fold_emits_no_private_control()
+    test_sglang_capabilities_are_truthful()
     test_vllm_pin_cache_policy()
     test_band_order_violation_caught()
     test_usage_normalization()

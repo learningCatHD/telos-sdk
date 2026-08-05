@@ -25,7 +25,7 @@ from typing import Any
 import aiohttp
 from aiohttp import web
 
-from telos.config import UpstreamConfig
+from telos.config import UpstreamCacheConfig, UpstreamConfig
 from telos.proxy.server import make_app
 
 
@@ -36,12 +36,21 @@ from telos.proxy.server import make_app
 class _MockOpenAIUpstream:
     """Records the received wire requests; returns chat-completions JSON or SSE."""
 
-    def __init__(self, *, sse: bool = False, with_usage: bool = True) -> None:
+    def __init__(
+        self,
+        *,
+        sse: bool = False,
+        with_usage: bool = True,
+        usage_override: dict[str, Any] | None = None,
+        cache_details: dict[str, Any] | None = None,
+    ) -> None:
         self.last_body: dict[str, Any] | None = None
         self.last_headers: dict[str, str] | None = None
         self.last_path: str | None = None
         self.sse = sse
         self.with_usage = with_usage
+        self.usage_override = usage_override
+        self.cache_details = cache_details
 
     async def handler(self, request: web.Request) -> web.StreamResponse:
         self.last_body = await request.json()
@@ -65,18 +74,28 @@ class _MockOpenAIUpstream:
                     b'{"prompt_cache_hit_tokens":900,"prompt_cache_miss_tokens":100,'
                     b'"completion_tokens":7}}\n\n'
                 )
+            if self.cache_details is not None:
+                chunks.append(
+                    b"data: " + json.dumps({
+                        "id": "x",
+                        "choices": [],
+                        "sglext": {
+                            "cached_tokens_details": self.cache_details,
+                        },
+                    }).encode("utf-8") + b"\n\n"
+                )
             chunks.append(b'data: [DONE]\n\n')
             for c in chunks:
                 await response.write(c)
             await response.write_eof()
             return response
 
-        usage = {
+        usage = self.usage_override if self.usage_override is not None else ({
             "prompt_cache_hit_tokens": 900,
             "prompt_cache_miss_tokens": 100,
             "completion_tokens": 7,
-        } if self.with_usage else {}
-        return web.json_response({
+        } if self.with_usage else {})
+        response_body = {
             "id": "cmpl_test",
             "object": "chat.completion",
             "model": "deepseek-chat",
@@ -86,7 +105,12 @@ class _MockOpenAIUpstream:
                 "finish_reason": "stop",
             }],
             "usage": usage,
-        })
+        }
+        if self.cache_details is not None:
+            response_body["sglext"] = {
+                "cached_tokens_details": self.cache_details,
+            }
+        return web.json_response(response_body)
 
 
 # ---------------------------------------------------------------------------
@@ -323,6 +347,125 @@ async def _test_openai_route_streaming() -> None:
                 assert b"[DONE]" in received
                 assert b"prompt_cache_hit_tokens" in received
         print("✓ test_openai_route_streaming")
+    finally:
+        await px_runner.cleanup()
+        await up_runner.cleanup()
+
+
+async def _test_sglang_route_uses_adapter_and_logs_cache(tmp_log: Path) -> None:
+    mock = _MockOpenAIUpstream(usage_override={
+        "prompt_tokens": 1000,
+        "prompt_tokens_details": {"cached_tokens": 800},
+        "completion_tokens": 7,
+    }, cache_details={
+        "device": 100,
+        "host": 600,
+        "storage": 100,
+        "storage_backend": "file",
+    })
+    up_runner, up_url = await _start_upstream(mock)
+    extra = {
+        "sglang": UpstreamConfig(
+            url=up_url,
+            engine="sglang",
+            protocol="openai-chat",
+            cache=UpstreamCacheConfig(
+                mode="stock",
+                backend="hicache",
+                tier_telemetry=True,
+                security_namespace="opaque:test",
+            ),
+        ),
+    }
+    px_runner, px_url = await _start_proxy(
+        up_url, usage_log=tmp_log, extra_slugs=extra,
+    )
+    try:
+        request_body = _sample_chat_request()
+        request_body.update({
+            "temperature": 0.25,
+            "cache_control": {"lock_radix_path": True},
+            "cache_policy": {"evict_span": [0, 1]},
+            "telos_cache": {"namespace": "user-controlled"},
+            "cache_salt": "user-controlled",
+        })
+        async with aiohttp.ClientSession() as client:
+            async with client.post(
+                f"{px_url}/upstreams/sglang/v1/chat/completions",
+                json=request_body,
+                headers={"x-telos-session": "sglang-stock"},
+            ) as resp:
+                assert resp.status == 200, await resp.text()
+
+        wire = mock.last_body or {}
+        for private_field in (
+            "cache_control", "cache_policy", "telos_cache", "cache_salt",
+        ):
+            assert private_field not in wire
+        assert wire["temperature"] == 0.25
+        assert wire["model"] == "deepseek-chat"
+        assert wire["return_cached_tokens_details"] is True
+
+        record = json.loads(tmp_log.read_text().strip().splitlines()[-1])
+        assert record["normalized"]["cache_read"] == 800
+        assert record["normalized"]["raw_input"] == 200
+        assert record["cache_runtime"]["engine"] == "sglang"
+        assert record["cache_runtime"]["wire_emitter"] == "adapter"
+        assert record["cache_runtime"]["backend"] == "hicache"
+        assert record["cache_runtime"]["hit_ratio"] == 0.8
+        assert record["cache_runtime"]["hit_tier_tokens"] == {
+            "gpu": 100, "cpu": 600, "l3": 100,
+        }
+        assert record["cache_runtime"]["restored_tokens"] == 700
+        assert record["cache_runtime"]["storage_backend"] == "file"
+        assert record["raw_cache_telemetry"]["source"] == (
+            "sglext.cached_tokens_details"
+        )
+        print("✓ test_sglang_route_uses_adapter_and_logs_cache")
+    finally:
+        await px_runner.cleanup()
+        await up_runner.cleanup()
+
+
+async def _test_sglang_stream_logs_tier_details(tmp_log: Path) -> None:
+    mock = _MockOpenAIUpstream(
+        sse=True,
+        cache_details={"device": 64, "host": 832, "storage": 0},
+    )
+    up_runner, up_url = await _start_upstream(mock)
+    extra = {
+        "sglang-stream": UpstreamConfig(
+            url=up_url,
+            engine="sglang",
+            protocol="openai-chat",
+            cache=UpstreamCacheConfig(
+                backend="hicache",
+                tier_telemetry=True,
+            ),
+        ),
+    }
+    px_runner, px_url = await _start_proxy(
+        up_url, usage_log=tmp_log, extra_slugs=extra,
+    )
+    try:
+        request_body = _sample_chat_request()
+        request_body["stream"] = True
+        request_body["stream_options"] = {"include_usage": True}
+        async with aiohttp.ClientSession() as client:
+            async with client.post(
+                f"{px_url}/upstreams/sglang-stream/v1/chat/completions",
+                json=request_body,
+            ) as response:
+                assert response.status == 200
+                await response.read()
+
+        assert (mock.last_body or {})["return_cached_tokens_details"] is True
+        record = json.loads(tmp_log.read_text().strip().splitlines()[-1])
+        assert record["streaming"] is True
+        assert record["cache_runtime"]["hit_tier_tokens"] == {
+            "gpu": 64, "cpu": 832, "l3": 0,
+        }
+        assert record["cache_runtime"]["restored_tokens"] == 832
     finally:
         await px_runner.cleanup()
         await up_runner.cleanup()
@@ -737,6 +880,18 @@ def test_openai_tag_attributes_each_harness(tmp_path) -> None:
 
 def test_openai_route_streaming() -> None:
     asyncio.run(_test_openai_route_streaming())
+
+
+def test_sglang_route_uses_adapter_and_logs_cache(tmp_path) -> None:
+    asyncio.run(_test_sglang_route_uses_adapter_and_logs_cache(
+        tmp_path / "usage.jsonl",
+    ))
+
+
+def test_sglang_stream_logs_tier_details(tmp_path) -> None:
+    asyncio.run(_test_sglang_stream_logs_tier_details(
+        tmp_path / "usage.jsonl",
+    ))
 
 
 def test_unknown_slug_returns_404() -> None:

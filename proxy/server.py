@@ -42,6 +42,7 @@ from typing import Any, Mapping, TYPE_CHECKING
 import aiohttp
 from aiohttp import web
 
+from telos import load_engine
 from telos.bridge import BridgeSessionState
 from telos.corpus import record_call
 from telos.output_filter import MODE_LABELS, TelosMode, apply_filter, build_filter
@@ -52,6 +53,7 @@ from telos.proxy.inspector import (
     entry_to_json as _inspector_entry_to_json,
 )
 from telos.proxy.pipeline import (
+    _RESERVED_CACHE_FIELDS,
     PipelineResult,
     process_anthropic_request,
     process_openai_request,
@@ -246,10 +248,9 @@ def _normalize_openai_usage(u: Mapping[str, Any]) -> dict[str, int]:
             "output": int(u.get("completion_tokens") or 0),
         }
     pt = int(u.get("prompt_tokens") or 0)
-    cached = int(
-        (u.get("prompt_tokens_details") or {}).get("cached_tokens", 0)
-        or u.get("cached_tokens", 0)
-    )
+    details_obj = u.get("prompt_tokens_details") or {}
+    details = details_obj if isinstance(details_obj, Mapping) else {}
+    cached = int(details.get("cached_tokens", 0) or u.get("cached_tokens", 0))
     return {
         "raw_input": max(pt - cached, 0),
         "cache_read": cached,
@@ -1512,6 +1513,16 @@ class ProxyApp:
         except Exception as e:  # noqa: BLE001
             return _anthropic_error(400, "invalid_request_error",
                                     f"Invalid JSON: {e}")
+        if not isinstance(raw, dict):
+            return _anthropic_error(
+                400, "invalid_request_error", "JSON body must be an object",
+            )
+        # Cache policy is gateway-owned. Strip client attempts even when the
+        # request later runs in passthrough optimization mode.
+        raw = {
+            key: value for key, value in raw.items()
+            if key not in _RESERVED_CACHE_FIELDS
+        }
 
         session_id = (
             request.headers.get("x-telos-session")
@@ -1537,6 +1548,9 @@ class ProxyApp:
                     session_id=session_id,
                     session_state=session_state,
                     engine_name=upstream_cfg.engine,
+                    cache_mode=upstream_cfg.cache.mode,
+                    cache_backend=upstream_cfg.cache.backend,
+                    cache_tier_telemetry=upstream_cfg.cache.tier_telemetry,
                 )
             except Exception as e:  # noqa: BLE001
                 self._pipeline_failures += 1
@@ -1555,6 +1569,11 @@ class ProxyApp:
                     plan_slots=[],
                     routing_key=None,
                     model=raw.get("model", ""),
+                    engine=upstream_cfg.engine,
+                    wire_protocol="openai-chat",
+                    wire_emitter="passthrough",
+                    cache_mode=upstream_cfg.cache.mode,
+                    cache_backend=upstream_cfg.cache.backend,
                 )
         else:
             result = PipelineResult(
@@ -1563,6 +1582,11 @@ class ProxyApp:
                 plan_slots=[],
                 routing_key=None,
                 model=raw.get("model", ""),
+                engine=upstream_cfg.engine,
+                wire_protocol="openai-chat",
+                wire_emitter="passthrough",
+                cache_mode=upstream_cfg.cache.mode,
+                cache_backend=upstream_cfg.cache.backend,
             )
 
         # Attribution: label the usage-log entry with the calling agent's identity.
@@ -1644,10 +1668,15 @@ class ProxyApp:
             upstream.release()
 
         usage: dict[str, Any] = {}
+        cache_telemetry: Mapping[str, Any] = {}
         if status == 200:
             try:
                 parsed = json.loads(body.decode("utf-8"))
                 usage = parsed.get("usage") or {}
+                if isinstance(parsed, Mapping):
+                    cache_telemetry = load_engine(
+                        result.engine,
+                    ).parse_cache_telemetry(parsed)
             except Exception:  # noqa: BLE001
                 pass
         elif status >= 400:
@@ -1661,6 +1690,7 @@ class ProxyApp:
             streaming=False,
             status=status,
             call_index=call_index,
+            cache_telemetry=cache_telemetry,
         )
         # ``_update_inspector`` reads usage via the anthropic normalizer; for
         # OpenAI traffic the dashboard's openai-side metrics are owned by
@@ -1719,6 +1749,7 @@ class ProxyApp:
             return downstream
 
         usage_aggregate: dict[str, Any] = {}
+        cache_details: dict[str, Any] = {}
         sse_buf = b""
         try:
             async for chunk in upstream.content.iter_any():
@@ -1731,7 +1762,9 @@ class ProxyApp:
                 sse_buf += chunk
                 while b"\n\n" in sse_buf:
                     block, sse_buf = sse_buf.split(b"\n\n", 1)
-                    self._peek_openai_sse_block(block, usage_aggregate)
+                    self._peek_openai_sse_block(
+                        block, usage_aggregate, cache_details,
+                    )
         except aiohttp.ClientPayloadError:
             _log.warning("upstream closed connection mid-stream (call=%d)",
                          call_index)
@@ -1744,17 +1777,31 @@ class ProxyApp:
             upstream.release()
 
         latency_s = time.time() - t0
+        cache_telemetry: Mapping[str, Any] = {}
+        if cache_details:
+            try:
+                cache_telemetry = load_engine(
+                    result.engine,
+                ).parse_cache_telemetry({
+                    "sglext": {"cached_tokens_details": cache_details},
+                })
+            except Exception:  # noqa: BLE001
+                pass
         self._log_openai_usage(
             session_id, result, usage_aggregate, session_state,
             latency_s=latency_s,
             streaming=True,
             status=200,
             call_index=call_index,
+            cache_telemetry=cache_telemetry,
         )
         return downstream
 
     def _peek_openai_sse_block(
-        self, block: bytes, usage: dict[str, Any],
+        self,
+        block: bytes,
+        usage: dict[str, Any],
+        cache_details: dict[str, Any] | None = None,
     ) -> None:
         """OpenAI SSE chunk format: ``data: {...}\\n\\n``. The terminal chunk
         when ``stream_options.include_usage=true`` carries the full ``usage``.
@@ -1773,6 +1820,11 @@ class ProxyApp:
             u = data.get("usage")
             if isinstance(u, dict):
                 usage.update(u)
+            extension = data.get("sglext")
+            if cache_details is not None and isinstance(extension, Mapping):
+                details = extension.get("cached_tokens_details")
+                if isinstance(details, Mapping):
+                    cache_details.update(details)
 
     def _log_openai_usage(
         self,
@@ -1785,11 +1837,41 @@ class ProxyApp:
         streaming: bool,
         status: int,
         call_index: int,
+        cache_telemetry: Mapping[str, Any] | None = None,
     ) -> None:
         """Append one OpenAI-side usage line to the usage log (dashboard input)."""
         if self.usage_log is None:
             return
         try:
+            normalized = _normalize_openai_usage(usage)
+            prompt_tokens = normalized["raw_input"] + normalized["cache_read"]
+            cache_runtime = {
+                "engine": result.engine,
+                "mode": result.cache_mode,
+                "backend": result.cache_backend,
+                "wire_emitter": result.wire_emitter,
+                "prompt_tokens": prompt_tokens,
+                "cached_tokens": normalized["cache_read"],
+                "computed_prefill_tokens": normalized["raw_input"],
+                "hit_ratio": (
+                    round(normalized["cache_read"] / prompt_tokens, 6)
+                    if prompt_tokens else 0.0
+                ),
+            }
+            if cache_telemetry:
+                tier_tokens = cache_telemetry.get("hit_tier_tokens")
+                if isinstance(tier_tokens, Mapping):
+                    normalized_tiers = {
+                        name: int(tier_tokens.get(name, 0) or 0)
+                        for name in ("gpu", "cpu", "l3")
+                    }
+                    cache_runtime["hit_tier_tokens"] = normalized_tiers
+                    cache_runtime["restored_tokens"] = (
+                        normalized_tiers["cpu"] + normalized_tiers["l3"]
+                    )
+                cache_runtime["storage_backend"] = cache_telemetry.get(
+                    "storage_backend",
+                )
             with self.usage_log.open("a") as f:
                 f.write(json.dumps({
                     "ts": time.time(),
@@ -1806,7 +1888,9 @@ class ProxyApp:
                     "streaming": streaming,
                     "status": status,
                     "raw_usage": dict(usage),
-                    "normalized": _normalize_openai_usage(usage),
+                    "raw_cache_telemetry": dict(cache_telemetry or {}),
+                    "normalized": normalized,
+                    "cache_runtime": cache_runtime,
                     "cumulative": {
                         "cache_creation":
                             session_state.stats.cumulative_cache_creation,

@@ -22,7 +22,9 @@ from typing import Any, Mapping
 
 from telos import Bridge, load_engine, load_harness
 from telos.bridge import BridgeSessionState, _canonicalize_ir
-from telos.ir import Band, TelosIR
+from telos.engine.base import UnsupportedWireProtocolError
+from telos.engine.openai_chat import render_chat_completions
+from telos.ir import Band, TelosIR, assert_ir_invariants
 from telos.scripts.telos_anthropic_transport import _detect_harness
 
 
@@ -39,6 +41,13 @@ _OPENAI_PASSTHROUGH_FIELDS = (
     "seed", "stream_options", "logit_bias", "logprobs", "top_logprobs", "n",
     "user",
 )
+
+# Never trust client-supplied cache-control fields. Stock adapters do not emit
+# these, and future extension fields must be derived from authenticated gateway
+# state after capability negotiation.
+_RESERVED_CACHE_FIELDS = frozenset({
+    "telos_cache", "cache_control", "cache_policy", "cache_salt",
+})
 
 
 @dataclass
@@ -72,6 +81,11 @@ class PipelineResult:
     plan_slots: list[str]
     routing_key: str | None
     model: str = ""
+    engine: str = ""
+    wire_protocol: str = ""
+    wire_emitter: str = ""
+    cache_mode: str = "stock"
+    cache_backend: str = "auto"
     cumulative_cache_creation: int = 0
     real_requests_since_refresh: int = 0
     ir_layout: dict[str, Any] = field(default_factory=dict)
@@ -152,6 +166,9 @@ def process_anthropic_request(
         plan_slots=[s.name for s in plan.slots],
         routing_key=plan.routing_key,
         model=raw.get("model", ""),
+        engine=engine_name,
+        wire_protocol="anthropic-messages",
+        wire_emitter="adapter",
         cumulative_cache_creation=state.stats.cumulative_cache_creation,
         real_requests_since_refresh=state.stats.real_requests_since_refresh,
         ir_layout=layout,
@@ -170,6 +187,9 @@ def process_openai_request(
     session_id: str,
     session_state: BridgeSessionState | None = None,
     engine_name: str = "deepseek",
+    cache_mode: str = "stock",
+    cache_backend: str = "auto",
+    cache_tier_telemetry: bool = False,
 ) -> "PipelineResult":
     """Run the TELOS pipeline once for an OpenAI ChatCompletions request.
 
@@ -189,38 +209,48 @@ def process_openai_request(
         always ``"telos"`` (this is what the dashboard expects for OpenAI
         traffic; the ``telos`` harness is the one that parses OpenAI shape).
     """
-    # Imported here to avoid a top-level cycle (scripts.telos_transport itself
-    # imports from telos, which transitively imports proxy.pipeline in tests).
-    from telos.scripts.telos_transport import _ir_to_chat_completions
-
     harness = load_harness("telos")
     engine = load_engine(engine_name)
-    model = str(raw.get("model", ""))
+    sanitized_raw = {
+        key: value for key, value in raw.items()
+        if key not in _RESERVED_CACHE_FIELDS
+    }
+    model = str(sanitized_raw.get("model", ""))
 
     ir = harness.parse(
-        raw,
+        sanitized_raw,
         session_id=session_id,
         engine=engine_name,
         model=model,
     )
     bridge = Bridge(ir, engine, session_state=session_state)
 
-    # The OpenAI path does NOT go through engine.emit (which produces the
-    # Responses API shape); it uses _ir_to_chat_completions instead. So we
-    # must drive Bridge by hand: mark + canonicalize the IR, then build the
-    # chat-completions wire ourselves. This mirrors TelosOpenAITransport._do_create.
-    plan = bridge.mark()
     ir2 = _canonicalize_ir(bridge.snapshot_ir())
-    wire = _ir_to_chat_completions(ir2, model=model)
+    assert_ir_invariants(ir2)
+    plan = engine.plan_marks(ir2)
+    try:
+        wire = dict(engine.emit_for_protocol(
+            ir2, plan, protocol="openai-chat",
+        ))
+        wire_emitter = "adapter"
+    except UnsupportedWireProtocolError:
+        wire = render_chat_completions(ir2, model=model)
+        wire_emitter = "generic"
+
+    # Adapter-owned public telemetry fields are injected after rendering and
+    # before caller sampling fields. Clients cannot spoof these fields because
+    # they are not part of the passthrough allowlist.
+    wire.update(engine.cache_telemetry_request_fields(
+        tier_details=cache_tier_telemetry and cache_mode != "off",
+    ))
 
     # Pass through the caller's non-TELOS fields (temperature, stream, etc.).
     for k in _OPENAI_PASSTHROUGH_FIELDS:
-        if k in raw and raw[k] is not None:
-            wire[k] = raw[k]
+        if k in sanitized_raw and sanitized_raw[k] is not None:
+            wire[k] = sanitized_raw[k]
 
-    # Mirror TelosOpenAITransport: bump the real-request counter (engine.emit
-    # would have done it; the chat-completions path bypasses that, so do it
-    # explicitly to keep R8 visibility consistent).
+    # Mirror Bridge.emit_with_plan: this protocol-specific path performs its
+    # own canonicalize/plan/emit sequence, so update R8 visibility here.
     state = bridge.session_state
     state.stats.real_requests_since_refresh += 1
 
@@ -233,6 +263,11 @@ def process_openai_request(
         plan_slots=[s.name for s in plan.slots],
         routing_key=plan.routing_key,
         model=model,
+        engine=engine_name,
+        wire_protocol="openai-chat",
+        wire_emitter=wire_emitter,
+        cache_mode=cache_mode,
+        cache_backend=cache_backend,
         cumulative_cache_creation=state.stats.cumulative_cache_creation,
         real_requests_since_refresh=state.stats.real_requests_since_refresh,
         ir_layout=layout,
