@@ -1,5 +1,21 @@
 <div align="center">
 
+<a href="https://github.com/eryflow/telos-sdk">
+  <img src="https://img.shields.io/badge/NEW_HOME-eryflow%2Ftelos--sdk-0969DA?style=for-the-badge&logo=github&logoColor=white" alt="新仓库：eryflow/telos-sdk" />
+</a>
+
+## TELOS SDK 已迁移至新家
+
+本项目已迁移至 **[eryflow/telos-sdk](https://github.com/eryflow/telos-sdk)**。
+
+[**前往新仓库 →**](https://github.com/eryflow/telos-sdk)
+
+</div>
+
+---
+
+<div align="center">
+
 <img src="assets/logo.svg" alt="TELOS — 可移植 Agent 上下文" width="460"/>
 
 ### 上下文归你所有 &nbsp;·&nbsp; Agent 是雇来的

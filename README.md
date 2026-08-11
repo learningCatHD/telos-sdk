@@ -1,5 +1,21 @@
 <div align="center">
 
+<a href="https://github.com/eryflow/telos-sdk">
+  <img src="https://img.shields.io/badge/NEW_HOME-eryflow%2Ftelos--sdk-0969DA?style=for-the-badge&logo=github&logoColor=white" alt="New home: eryflow/telos-sdk" />
+</a>
+
+## TELOS SDK has a new home
+
+This project has moved to **[eryflow/telos-sdk](https://github.com/eryflow/telos-sdk)**.
+
+[**Visit the new repository →**](https://github.com/eryflow/telos-sdk)
+
+</div>
+
+---
+
+<div align="center">
+
 <img src="assets/logo.svg" alt="TELOS — Portable Agent Context" width="460"/>
 
 ### Context is yours &nbsp;·&nbsp; Agents are hired
