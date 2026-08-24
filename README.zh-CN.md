@@ -1,10 +1,15 @@
 <div align="center">
 
-## 🚚 本项目已迁移
+# 🚚 Project Moved &nbsp;·&nbsp; 本项目已迁移
 
-最新代码、版本发布、Issue 与文档均已转移至新仓库。
+**The latest code, releases, issues, and documentation now live in the new repository.**<br/>
+**最新代码、版本发布、Issue 与文档均已转移至新仓库。**
 
-<a href="https://github.com/eryflow/telos-sdk"><img src="https://img.shields.io/badge/前往新仓库-eryflow%2Ftelos--sdk-2ea44f?style=for-the-badge&logo=github&logoColor=white" alt="前往新的 eryflow/telos-sdk 仓库" /></a>
+<a href="https://github.com/eryflow/telos-sdk">
+  <img src="https://img.shields.io/badge/🚀_GO_TO_THE_NEW_REPO_前往新仓库-eryflow%2Ftelos--sdk-2ea44f?style=for-the-badge&logo=github&logoColor=white" alt="Open the new eryflow/telos-sdk repository"/>
+</a>
+
+<sub>⬇️ 以下为归档内容，仅供参考 &nbsp;·&nbsp; The content below is archived for reference only</sub>
 
 </div>
 
